@@ -1,6 +1,6 @@
 # 🤖 Bot de Verificação — Shai WZL
 
-Bot para Discord (discord.js v14) que automatiza a verificação de membros a partir de um **print de tela**, confirmando via OCR se o usuário está inscrito no canal **Shai WZL** e liberando um cargo de acesso automaticamente. Conta ainda com aprovação/recusa manual pela staff, sistema honeypot anti-invasão e logs completos.
+Bot para Discord (discord.js v14) que automatiza a verificação de membros a partir de um **print de tela**, confirmando via OCR se o usuário está inscrito em um canal específico do Youtube e liberando um cargo de acesso automaticamente. Conta ainda com aprovação/recusa manual pela staff, sistema honeypot anti-invasão e logs completos.
 
 ## ✨ Funcionalidades
 
@@ -42,20 +42,21 @@ Crie um arquivo `.env` na raiz do projeto:
 | `VERIFIED_ROLE_ID` | ✅ | ID do cargo liberado após a verificação |
 | `LOG_CHANNEL_ID` | ✅ | ID do canal onde os logs de verificação são enviados |
 | `HONEYPOT_CHANNEL_ID` | ✅ | ID do canal-armadilha (qualquer mensagem nele resulta em kick) |
+| `CHANNEL_NAME_VARIANTS` | ✅ | Variações do nome do canal que o OCR deve encontrar no print, separadas por vírgula (ex: `shai wzl,shai_wzl,@shai_wzl,shai-wzl`) |
 | `GUILD_ID` | Recomendada | ID do servidor (usado para atualizar a contagem de membros na presença) |
-| `STAFF_CHANNEL_ID` | Opcional | Canal para onde vão os pedidos de análise manual (tem valor padrão no código) |
-| `STAFF_ROLE_ID` | Opcional | Cargo da equipe de suporte, mencionado nos pedidos de análise manual (tem valor padrão no código) |
-| `ROLES_CHANNEL_ID` | Opcional | Canal onde o usuário reivindica cargos após aprovação pública (tem valor padrão no código) |
-| `ROLES_BUTTON_URL` | Opcional | URL usada no botão de "Receber os sistemas" (tem valor padrão no código) |
+| `STAFF_CHANNEL_ID` | ✅ | Canal para onde vão os pedidos de análise manual (erro de OCR) |
+| `STAFF_ROLE_ID` | ✅ | Cargo da equipe de suporte, mencionado nos pedidos de análise manual |
+| `ROLES_CHANNEL_ID` | ✅ | Canal onde o usuário reivindica cargos após aprovação pública (`/aprovar visivel:true`) |
+| `ROLES_BUTTON_URL` | ✅ | URL usada no botão "Receber os sistemas" da aprovação pública |
 
-> ⚠️ Os valores padrão de `STAFF_CHANNEL_ID`, `STAFF_ROLE_ID`, `ROLES_CHANNEL_ID` e `ROLES_BUTTON_URL` estão fixos no código-fonte. Recomenda-se sobrescrevê-los via `.env` ao reutilizar o bot em outro servidor.
+> ⚠️ `STAFF_CHANNEL_ID`, `STAFF_ROLE_ID`, `ROLES_CHANNEL_ID`, `ROLES_BUTTON_URL` e `CHANNEL_NAME_VARIANTS` não têm mais valor padrão no código — precisam estar definidas no `.env`. Se `CHANNEL_NAME_VARIANTS` ficar vazia, nenhuma verificação automática vai passar (a checagem do nome do canal nunca encontra correspondência); se as demais ficarem vazias, notificação à staff, botão de cargos, etc. não funcionam corretamente.
 
 ## 🧠 Como funciona a verificação automática
 
 1. O usuário envia uma imagem no `VERIFICATION_CHANNEL_ID`.
 2. O bot reage com ⏳, baixa o texto da imagem via OCR.space (engine 2, idioma automático, com fallback para português) e apaga a reação ao concluir.
 3. O texto extraído é normalizado (removendo acentos, pontuação e caixa) e analisado em busca de:
-   - **Nome do canal**: Defina as variações no .env.example.
+   - **Nome do canal**: qualquer uma das variações definidas em `CHANNEL_NAME_VARIANTS`.
    - **Palavra de confirmação de inscrição**: `inscrito`, `inscrita`, `suscrito`, `subscribed`, etc. — com uma checagem extra para ignorar falsos positivos como "300 mil inscritos" (número antes da palavra).
 4. **Aprovado** (nome do canal + confirmação encontrados): reage ✅, adiciona o cargo, envia DM e log, e responde com um embed de sucesso que se autodestrói (junto da mensagem original) após 7,5 segundos.
 5. **Recusado**: reage ❌, informa o(s) motivo(s) da recusa, envia DM e log.
