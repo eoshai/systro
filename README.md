@@ -1,6 +1,6 @@
 # 🤖 Bot de Verificação — Shai WZL
 
-Bot para Discord (discord.js v14) que automatiza a verificação de membros a partir de um **print de tela**, confirmando via OCR se o usuário está inscrito em um canal específico do Youtube e liberando um cargo de acesso automaticamente. Conta ainda com aprovação/recusa manual pela staff, sistema honeypot anti-invasão e logs completos.
+Bot para Discord (discord.js v14) que automatiza a verificação de membros a partir de um **print de tela**, confirmando via OCR se o usuário está inscrito no canal **Shai WZL** e liberando um cargo de acesso automaticamente. Conta ainda com aprovação/recusa manual pela staff, sistema honeypot anti-invasão e logs completos.
 
 ## ✨ Funcionalidades
 
@@ -14,6 +14,11 @@ Bot para Discord (discord.js v14) que automatiza a verificação de membros a pa
 - **Presença dinâmica** do bot mostrando a contagem de membros do servidor, atualizada a cada 10 minutos.
 - **Deduplicação de eventos** do Gateway do Discord (evita processar a mesma mensagem/interação duas vezes após um *resume* de conexão).
 - **Cache otimizado** (mensagens, usuários, membros e presenças não ficam em RAM) para baixo consumo de memória.
+- **Rate limit por usuário**: no máximo 3 tentativas de verificação a cada 10 minutos, evitando spam/abuso da API de OCR.
+- **Aviso de falhas seguidas**: após 3 recusas seguidas, o bot sugere ao usuário abrir um ticket com a staff.
+- **Botões diretos no embed da staff**: quando o OCR falha, o embed de análise manual já vem com botões "Aprovar" e "Recusar" (o de recusar abre um pequeno formulário para o motivo), sem precisar digitar `/aprovar` ou `/recusar` manualmente.
+- **`/pendentes`**: lista as verificações aguardando análise manual da staff, com link direto para cada solicitação.
+- **`/stats`**: mostra estatísticas de aprovações, recusas e erros de OCR (hoje / 7 dias / total).
 
 ## ⚙️ Pré-requisitos
 
@@ -62,6 +67,8 @@ Crie um arquivo `.env` na raiz do projeto:
 5. **Recusado**: reage ❌, informa o(s) motivo(s) da recusa, envia DM e log.
 6. **Erro de leitura da imagem** (falha do OCR): reage ⚠️, encaminha o print para o `STAFF_CHANNEL_ID` (mencionando `STAFF_ROLE_ID`) para revisão manual e avisa o usuário por DM e no canal.
 7. Imagens acima de **5 MB** são rejeitadas com um aviso (mensagem removida após 15 segundos).
+8. Cada usuário tem no máximo **3 tentativas a cada 10 minutos**; ao exceder isso, o bot avisa quanto tempo falta para tentar novamente, sem gastar uma nova chamada de OCR.
+9. Após **3 recusas seguidas**, o bot manda um aviso extra sugerindo abrir um ticket com a staff (o contador zera depois do aviso).
 
 ## 🛡️ Segurança — Honeypot
 
@@ -76,6 +83,21 @@ Aprova manualmente a verificação de um usuário: adiciona o cargo (se ainda n�
 
 ### `/recusar usuario:<usuário> motivo:<texto>`
 Recusa manualmente a verificação, enviando DM ao usuário com o motivo informado (ou um motivo padrão) e registrando o log.
+
+### `/pendentes`
+Lista (de forma privada, só para quem executou o comando) as verificações que ainda aguardam análise manual, com o tempo de espera e um link direto para a solicitação no canal da staff.
+
+### `/stats`
+Mostra (de forma privada) um resumo com o número de aprovações automáticas, recusas automáticas, aprovações/recusas manuais e erros de OCR, comparando hoje, os últimos 7 dias e o total acumulado desde a última inicialização do bot.
+
+> ⚠️ As estatísticas e a lista de pendentes ficam **em memória** — são perdidas quando o processo reinicia. Para manter esse histórico entre reinícios, seria necessário adicionar um banco (ex.: SQLite).
+
+### Botões no embed de análise manual
+Quando o OCR falha em ler uma imagem, o embed enviado ao `STAFF_CHANNEL_ID` já vem com dois botões:
+- **✅ Aprovar** — libera o cargo, envia DM e log, e marca a pendência como resolvida direto no embed.
+- **❌ Recusar** — abre um pequeno formulário (modal) para a staff informar o motivo antes de recusar.
+
+Ambos os botões exigem que quem clique tenha o cargo `STAFF_ROLE_ID` ou a permissão `Manage Roles` — do contrário, o bot responde com um aviso de permissão negada (visível só para quem clicou).
 
 ## ⚠️ Observações importantes
 
