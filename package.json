@@ -1,0 +1,17 @@
+{
+  "name": "bot-verificacao-inscricao",
+  "version": "1.0.0",
+  "description": "Bot de Discord que verifica prints de inscrição no canal via OCR remoto (OCR.space), sem baixar imagem nem carregar libs de OCR em RAM.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
