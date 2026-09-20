@@ -41,6 +41,24 @@ const ROLES_BUTTON_URL =
 // Configurações adicionais
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // Limite de 5MB por imagem
 const RESULT_CLEANUP_DELAY_MS = 7500;
+const WARNING_CLEANUP_DELAY_MS = 15000; // avisos ("envie um print", "limite atingido"...)
+
+// Tempo máximo de espera por chamada à API de OCR (depois disso cai para revisão manual)
+const OCR_TIMEOUT_MS = 30 * 1000;
+
+// Quantas pendências o /pendentes lista de uma vez
+const PENDING_LIST_LIMIT = 15;
+
+// Honeypot: quanto do histórico do usuário banido é apagado (padrão 1h; máx. do Discord: 7 dias).
+// Pode ser ajustado com HONEYPOT_DELETE_SECONDS no .env.
+const HONEYPOT_MAX_DELETE_SECONDS = 7 * 24 * 60 * 60;
+const parsedDeleteSeconds = parseInt(process.env.HONEYPOT_DELETE_SECONDS ?? '', 10);
+const HONEYPOT_DELETE_SECONDS = Number.isNaN(parsedDeleteSeconds)
+  ? 60 * 60
+  : Math.min(Math.max(parsedDeleteSeconds, 0), HONEYPOT_MAX_DELETE_SECONDS);
+
+const ROLE_ERROR_MESSAGE =
+  '⚠️ Não consegui atribuir o cargo de verificado. Confira se o cargo do bot está acima dele na hierarquia e se o bot tem a permissão **Gerenciar Cargos**.';
 
 // Rate limit de tentativas de verificação (evita spam/abuso do OCR)
 const RATE_LIMIT_MAX_ATTEMPTS = 3;
@@ -58,6 +76,22 @@ const CHANNEL_NAME_VARIANTS = (process.env.CHANNEL_NAME_VARIANTS || '')
   .split(',')
   .map((v) => v.trim())
   .filter(Boolean);
+
+// Avisos de configuração incompleta (não são fatais, mas quebram partes do fluxo)
+const RECOMMENDED_ENV = {
+  OCR_API_KEY,
+  VERIFICATION_CHANNEL_ID,
+  VERIFIED_ROLE_ID,
+  LOG_CHANNEL_ID,
+  STAFF_CHANNEL_ID,
+  STAFF_ROLE_ID,
+};
+for (const [name, value] of Object.entries(RECOMMENDED_ENV)) {
+  if (!value) console.warn(`[CONFIG] ${name} não definido no .env — parte do fluxo pode não funcionar.`);
+}
+if (CHANNEL_NAME_VARIANTS.length === 0) {
+  console.warn('[CONFIG] CHANNEL_NAME_VARIANTS vazio — nenhuma verificação automática será aprovada.');
+}
 
 const CONFIRMATION_WORDS = [
   'inscrito',
@@ -109,11 +143,36 @@ function hasConfirmationWord(normalizedText) {
   return false;
 }
 
-function scheduleMessageCleanup(userMessage, botResponse) {
+function scheduleMessageCleanup(userMessage, botResponse, delayMs = RESULT_CLEANUP_DELAY_MS) {
   setTimeout(async () => {
     await userMessage.delete().catch(() => {});
     await botResponse.delete().catch(() => {});
-  }, RESULT_CLEANUP_DELAY_MS);
+  }, delayMs);
+}
+
+// Responde a mensagem do usuário com um aviso e apaga os dois depois de um tempo
+async function replyAndCleanup(message, content, delayMs = WARNING_CLEANUP_DELAY_MS) {
+  const aviso = await message.reply(content);
+  scheduleMessageCleanup(message, aviso, delayMs);
+  return aviso;
+}
+
+// 90 min -> "1h30min" | 45 min -> "45min"
+function formatWaitTime(ms) {
+  const totalMinutes = Math.floor(ms / 60000);
+  if (totalMinutes < 60) return `${totalMinutes}min`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes ? `${hours}h${minutes}min` : `${hours}h`;
+}
+
+// 3600 -> "1 hora(s)" | 86400 -> "1 dia(s)" | 0 -> "nenhum"
+function formatDuration(totalSeconds) {
+  if (totalSeconds <= 0) return 'nenhum';
+  if (totalSeconds % 86400 === 0) return `${totalSeconds / 86400} dia(s)`;
+  if (totalSeconds % 3600 === 0) return `${totalSeconds / 3600} hora(s)`;
+  if (totalSeconds % 60 === 0) return `${totalSeconds / 60} min`;
+  return `${totalSeconds}s`;
 }
 
 // ---------------------------------------------------------------------
@@ -174,6 +233,39 @@ function registerFailure(userId) {
 
 function resetFailures(userId) {
   consecutiveFailures.delete(userId);
+}
+
+// Remove usuários cujas tentativas já expiraram, para o Map não crescer indefinidamente
+function sweepExpiredAttempts() {
+  const now = Date.now();
+  for (const [userId, timestamps] of verificationAttempts) {
+    if (timestamps.every((t) => now - t >= RATE_LIMIT_WINDOW_MS)) {
+      verificationAttempts.delete(userId);
+    }
+  }
+}
+
+// O cache de membros está desabilitado (poupa RAM), então buscamos na API quando preciso
+async function fetchMember(guild, userId) {
+  return guild.members.cache.get(userId) ?? (await guild.members.fetch(userId).catch(() => null));
+}
+
+function hasVerifiedRole(member) {
+  return Boolean(VERIFIED_ROLE_ID && member?.roles.cache.has(VERIFIED_ROLE_ID));
+}
+
+// Retorna true se o membro já tem (ou passou a ter) o cargo; false se a atribuição falhou
+async function grantVerifiedRole(member) {
+  if (!VERIFIED_ROLE_ID) return true;
+  if (member.roles.cache.has(VERIFIED_ROLE_ID)) return true;
+
+  try {
+    await member.roles.add(VERIFIED_ROLE_ID);
+    return true;
+  } catch (err) {
+    console.error('[CARGO ERRO]', err.message);
+    return false;
+  }
 }
 
 function recordStatEvent(type) {
@@ -258,6 +350,48 @@ async function notifyStaffForManualReview(client, user, imageUrl) {
 }
 
 // ---------------------------------------------------------------------
+// Gestão de pendências
+// ---------------------------------------------------------------------
+
+// Encerra todas as solicitações manuais abertas de um usuário: remove do Map
+// (some do /pendentes) e desativa os botões na mensagem da staff. Usado quando o
+// caso foi resolvido por outro caminho (/aprovar, /recusar, outro botão) ou
+// quando o usuário saiu do servidor.
+async function closePendingReviewsForUser(client, userId, { color, footerText }) {
+  const entries = [...pendingManualReviews.entries()].filter(([, data]) => data.userId === userId);
+
+  for (const [messageId, data] of entries) {
+    pendingManualReviews.delete(messageId);
+
+    try {
+      const channel = await client.channels.fetch(data.channelId);
+      const staffMessage = await channel.messages.fetch(messageId);
+      const embed = staffMessage.embeds[0]
+        ? EmbedBuilder.from(staffMessage.embeds[0])
+        : new EmbedBuilder();
+
+      embed.setColor(color).setFooter({ text: footerText });
+      await staffMessage.edit({ embeds: [embed], components: [] });
+    } catch (err) {
+      // Mensagem apagada ou sem acesso ao canal: a pendência já saiu do Map
+    }
+  }
+}
+
+// Confere se a mensagem da staff ainda existe e ainda tem os botões ativos
+async function isPendingStillOpen(client, messageId, data) {
+  try {
+    const channel = await client.channels.fetch(data.channelId);
+    const staffMessage = await channel.messages.fetch(messageId);
+    return staffMessage.components.length > 0;
+  } catch (err) {
+    // 10008 = Unknown Message | 10003 = Unknown Channel
+    if (err.code === 10008 || err.code === 10003) return false;
+    return true; // erro temporário (rede, rate limit): mantém a pendência
+  }
+}
+
+// ---------------------------------------------------------------------
 // Envio do Embed de Logs
 // ---------------------------------------------------------------------
 
@@ -323,6 +457,53 @@ async function sendLogEmbed(client, user, passed, durationSeconds, motivos = [],
 }
 
 // ---------------------------------------------------------------------
+// Log do Honeypot
+// ---------------------------------------------------------------------
+
+async function sendHoneypotLog(client, message, { banned, errorMessage = null }) {
+  try {
+    const logChannel = await client.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+    if (!logChannel) return;
+
+    const { author } = message;
+    const preview = (message.content || '').slice(0, 900).replace(/`/g, "'");
+
+    const embed = new EmbedBuilder()
+      .setColor(banned ? 0xe74c3c : 0xf39c12)
+      .setTitle(banned ? '🍯 Honeypot — usuário banido' : '🍯 Honeypot — falha ao banir')
+      .addFields(
+        { name: '👤 Usuário', value: `<@${author.id}>\n(\`${author.username}\`)`, inline: true },
+        { name: '🆔 ID', value: `\`${author.id}\``, inline: true },
+        { name: '📍 Canal', value: `<#${message.channel.id}>`, inline: true },
+        {
+          name: '💬 Mensagem',
+          value: preview ? `\`\`\`\n${preview}\n\`\`\`` : '*(sem texto — possivelmente só anexos)*',
+        }
+      )
+      .setThumbnail(author.displayAvatarURL({ size: 256 }))
+      .setFooter({ text: 'Sistema de Segurança' })
+      .setTimestamp();
+
+    if (banned) {
+      embed.addFields({
+        name: '🧹 Histórico apagado',
+        value: formatDuration(HONEYPOT_DELETE_SECONDS),
+        inline: true,
+      });
+    } else {
+      embed.addFields({
+        name: '⚠️ Erro',
+        value: `${errorMessage || 'desconhecido'}\nVerifique a permissão **Banir Membros** e a hierarquia de cargos do bot.`,
+      });
+    }
+
+    await logChannel.send({ embeds: [embed] });
+  } catch (err) {
+    console.error('[LOG HONEYPOT ERRO]', err.message);
+  }
+}
+
+// ---------------------------------------------------------------------
 // Embed público de aprovação (/aprovar visivel:true)
 // Usado quando a staff aprova alguém manualmente fora do canal de
 // verificação (ex.: respondendo a um print em um ticket).
@@ -355,18 +536,23 @@ async function sendPublicApprovalEmbed(interaction, targetUser) {
 // Chamada à API do OCR.space
 // ---------------------------------------------------------------------
 
-async function ocrFromImageUrl(imageUrl) {
+async function ocrFromImageUrl(imageUrl, language = 'auto') {
   const params = new URLSearchParams({
     apikey: OCR_API_KEY,
     url: imageUrl,
-    language: 'auto',
+    language,
     OCREngine: '2',
     scale: 'true',
     isOverlayRequired: 'false',
   });
 
   const endpoint = `https://api.ocr.space/parse/imageurl?${params.toString()}`;
-  const response = await fetch(endpoint, { method: 'GET' });
+
+  // Timeout evita que o handler fique pendurado se a API do OCR travar
+  const response = await fetch(endpoint, {
+    method: 'GET',
+    signal: AbortSignal.timeout(OCR_TIMEOUT_MS),
+  });
 
   if (!response.ok) throw new Error(`OCR.space respondeu HTTP ${response.status}`);
 
@@ -376,38 +562,19 @@ async function ocrFromImageUrl(imageUrl) {
     throw new Error(`OCR.space retornou erro: ${msg || 'desconhecido'}`);
   }
 
-  const parsedResults = data.ParsedResults || [];
-  return parsedResults.map((r) => r.ParsedText || '').join('\n');
+  return (data.ParsedResults || []).map((r) => r.ParsedText || '').join('\n');
 }
 
 async function extractTextFromAttachment(attachmentUrl) {
   try {
-    const text = await ocrFromImageUrl(attachmentUrl);
+    const text = await ocrFromImageUrl(attachmentUrl, 'auto');
     if (text && text.trim().length > 0) return text;
   } catch (err) {
     console.warn(`[OCR] Fallback acionado: ${err.message}`);
   }
 
-  const params = new URLSearchParams({
-    apikey: OCR_API_KEY,
-    url: attachmentUrl,
-    language: 'por',
-    OCREngine: '2',
-    scale: 'true',
-    isOverlayRequired: 'false',
-  });
-  const endpoint = `https://api.ocr.space/parse/imageurl?${params.toString()}`;
-  const response = await fetch(endpoint, { method: 'GET' });
-  
-  if (!response.ok) throw new Error(`OCR.space respondeu HTTP ${response.status}`);
-  
-  const data = await response.json();
-  if (data.IsErroredOnProcessing) {
-    const msg = Array.isArray(data.ErrorMessage) ? data.ErrorMessage.join('; ') : data.ErrorMessage;
-    throw new Error(`OCR.space retornou erro: ${msg || 'desconhecido'}`);
-  }
-  
-  return (data.ParsedResults || []).map((r) => r.ParsedText || '').join('\n');
+  // Segunda tentativa forçando português (erros aqui sobem para o chamador)
+  return ocrFromImageUrl(attachmentUrl, 'por');
 }
 
 function evaluateOcrText(rawText) {
@@ -499,6 +666,9 @@ client.once('ready', async () => {
   // Atualiza a contagem a cada 10 minutos (600.000 ms)
   setInterval(updatePresence, 600000);
 
+  // Limpa tentativas de rate limit já expiradas (evita crescimento do Map)
+  setInterval(sweepExpiredAttempts, RATE_LIMIT_WINDOW_MS);
+
   // Registro dos Slash Commands...
   const commands = [
     new SlashCommandBuilder()
@@ -545,6 +715,16 @@ client.once('ready', async () => {
   }
 });
 
+// Usuário saiu do servidor: encerra as pendências dele para não sobrarem em /pendentes
+client.on('guildMemberRemove', async (member) => {
+  if (GUILD_ID && member.guild.id !== GUILD_ID) return;
+
+  await closePendingReviewsForUser(client, member.id, {
+    color: 0x95a5a6,
+    footerText: '🚪 Usuário saiu do servidor — solicitação encerrada',
+  }).catch((err) => console.error('[PENDÊNCIA ERRO]', err.message));
+});
+
 // ---------------------------------------------------------------------
 // Handler de Comandos Slash (Verificação Manual)
 // ---------------------------------------------------------------------
@@ -555,7 +735,7 @@ function isStaffMember(member) {
   return member.permissions.has(PermissionFlagsBits.ManageRoles);
 }
 
-client.on('interactionCreate', async (interaction) => {
+async function handleInteraction(interaction) {
   if (!markProcessedOnce(processedInteractionIds, interaction.id)) return;
 
   // -----------------------------------------------------------------
@@ -576,25 +756,31 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const targetUser = options.getUser('usuario');
-      const member = await guild.members.fetch(targetUser.id).catch(() => null);
-
-      if (!member) {
-        return interaction.editReply({ content: '❌ Usuário não encontrado no servidor.' });
-      }
 
       if (commandName === 'aprovar') {
-        const visivel = options.getBoolean('visivel') ?? false;
+        // Aprovar exige o membro no servidor (ele precisa receber o cargo)
+        const member = await fetchMember(guild, targetUser.id);
 
-        if (VERIFIED_ROLE_ID && !member.roles.cache.has(VERIFIED_ROLE_ID)) {
-          await member.roles.add(VERIFIED_ROLE_ID).catch((err) =>
-            console.error('[CARGO ERRO]', err.message)
-          );
+        if (!member) {
+          return interaction.editReply({ content: '❌ Usuário não encontrado no servidor.' });
         }
+
+        if (!(await grantVerifiedRole(member))) {
+          return interaction.editReply({ content: ROLE_ERROR_MESSAGE });
+        }
+
+        const visivel = options.getBoolean('visivel') ?? false;
 
         await sendDMNotification(targetUser, true);
         await sendLogEmbed(client, targetUser, true, null, [], interaction.user);
         recordStatEvent('manual_approved');
         resetFailures(targetUser.id);
+
+        // Encerra solicitações pendentes desse usuário (tira dos /pendentes e desativa os botões)
+        await closePendingReviewsForUser(client, targetUser.id, {
+          color: 0x2ecc71,
+          footerText: `✅ Aprovado por ${interaction.user.tag} (via /aprovar)`,
+        });
 
         if (visivel) {
           await sendPublicApprovalEmbed(interaction, targetUser).catch((err) =>
@@ -607,38 +793,57 @@ client.on('interactionCreate', async (interaction) => {
         });
       }
 
-      if (commandName === 'recusar') {
-        const motivo = options.getString('motivo') || 'Recusado manualmente pela moderação.';
+      // /recusar: não exige que o usuário ainda esteja no servidor, assim a staff
+      // consegue limpar pendências de quem já saiu.
+      const motivo = options.getString('motivo') || 'Recusado manualmente pela moderação.';
 
-        await sendDMNotification(targetUser, false, motivo);
-        await sendLogEmbed(client, targetUser, false, null, [motivo], interaction.user);
-        recordStatEvent('manual_rejected');
+      await sendDMNotification(targetUser, false, motivo);
+      await sendLogEmbed(client, targetUser, false, null, [motivo], interaction.user);
+      recordStatEvent('manual_rejected');
 
-        return interaction.editReply({
-          content: `❌ Verificação de <@${targetUser.id}> recusada por <@${interaction.user.id}>.`,
-        });
-      }
+      await closePendingReviewsForUser(client, targetUser.id, {
+        color: 0xe74c3c,
+        footerText: `❌ Recusado por ${interaction.user.tag} (via /recusar)`,
+      });
+
+      return interaction.editReply({
+        content: `❌ Verificação de <@${targetUser.id}> recusada por <@${interaction.user.id}>.`,
+      });
     }
 
     if (commandName === 'pendentes') {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
+      // Descarta pendências cuja mensagem foi apagada ou já foi resolvida por outro caminho
+      const entries = [...pendingManualReviews.entries()];
+      const stillOpen = await Promise.all(
+        entries.map(([messageId, data]) => isPendingStillOpen(client, messageId, data))
+      );
+      entries.forEach(([messageId], index) => {
+        if (!stillOpen[index]) pendingManualReviews.delete(messageId);
+      });
+
       if (pendingManualReviews.size === 0) {
         return interaction.editReply('✅ Não há verificações pendentes no momento.');
       }
 
-      const linhas = [...pendingManualReviews.entries()]
-        .sort((a, b) => a[1].requestedAt - b[1].requestedAt)
-        .slice(0, 15)
-        .map(([messageId, data]) => {
-          const link = `https://discord.com/channels/${guild.id}/${data.channelId}/${messageId}`;
-          const minutos = Math.floor((Date.now() - data.requestedAt) / 60000);
-          return `• <@${data.userId}> — aguardando há **${minutos}min** — [ver solicitação](${link})`;
-        });
+      const sorted = [...pendingManualReviews.entries()].sort(
+        (a, b) => a[1].requestedAt - b[1].requestedAt
+      );
+
+      const linhas = sorted.slice(0, PENDING_LIST_LIMIT).map(([messageId, data]) => {
+        const link = `https://discord.com/channels/${guild.id}/${data.channelId}/${messageId}`;
+        const espera = formatWaitTime(Date.now() - data.requestedAt);
+        return `• <@${data.userId}> — aguardando há **${espera}** — [ver solicitação](${link})`;
+      });
+
+      if (sorted.length > PENDING_LIST_LIMIT) {
+        linhas.push(`\n… e mais **${sorted.length - PENDING_LIST_LIMIT}** pendência(s) mais recentes.`);
+      }
 
       const embed = new EmbedBuilder()
         .setColor(0xf1c40f)
-        .setTitle(`⏳ Verificações pendentes (${pendingManualReviews.size})`)
+        .setTitle(`⏳ Verificações pendentes (${sorted.length})`)
         .setDescription(linhas.join('\n'))
         .setTimestamp();
 
@@ -697,9 +902,7 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.deferUpdate();
 
       const targetUser = await client.users.fetch(userId).catch(() => null);
-      const member = targetUser
-        ? await interaction.guild.members.fetch(userId).catch(() => null)
-        : null;
+      const member = targetUser ? await fetchMember(interaction.guild, userId) : null;
 
       if (!member || !targetUser) {
         return interaction.followUp({
@@ -708,17 +911,25 @@ client.on('interactionCreate', async (interaction) => {
         });
       }
 
-      if (VERIFIED_ROLE_ID && !member.roles.cache.has(VERIFIED_ROLE_ID)) {
-        await member.roles.add(VERIFIED_ROLE_ID).catch((err) =>
-          console.error('[CARGO ERRO]', err.message)
-        );
+      // Se o cargo falhar, a solicitação continua aberta para a staff tentar de novo
+      if (!(await grantVerifiedRole(member))) {
+        return interaction.followUp({
+          content: ROLE_ERROR_MESSAGE,
+          flags: MessageFlags.Ephemeral,
+        });
       }
 
       await sendDMNotification(targetUser, true);
       await sendLogEmbed(client, targetUser, true, null, [], interaction.user);
       recordStatEvent('manual_approved');
       resetFailures(userId);
+
       pendingManualReviews.delete(interaction.message.id);
+      // Se o mesmo usuário tiver outras solicitações abertas, encerra todas
+      await closePendingReviewsForUser(client, userId, {
+        color: 0x2ecc71,
+        footerText: `✅ Aprovado por ${interaction.user.tag}`,
+      });
 
       const updatedEmbed = EmbedBuilder.from(interaction.message.embeds[0])
         .setColor(0x2ecc71)
@@ -769,7 +980,13 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     recordStatEvent('manual_rejected');
+
     pendingManualReviews.delete(interaction.message.id);
+    // Se o mesmo usuário tiver outras solicitações abertas, encerra todas
+    await closePendingReviewsForUser(client, userId, {
+      color: 0xe74c3c,
+      footerText: `❌ Recusado por ${interaction.user.tag}`,
+    });
 
     const updatedEmbed = EmbedBuilder.from(interaction.message.embeds[0])
       .setColor(0xe74c3c)
@@ -777,34 +994,75 @@ client.on('interactionCreate', async (interaction) => {
 
     return interaction.update({ embeds: [updatedEmbed], components: [] });
   }
+}
+
+// Wrapper: qualquer erro inesperado é logado e o usuário recebe um aviso,
+// em vez de ver "O aplicativo não respondeu".
+client.on('interactionCreate', async (interaction) => {
+  try {
+    await handleInteraction(interaction);
+  } catch (err) {
+    console.error('[INTERACTION ERRO]', err);
+
+    try {
+      const payload = {
+        content: '❌ Ocorreu um erro inesperado ao processar essa ação. Tente novamente.',
+        flags: MessageFlags.Ephemeral,
+      };
+      if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
+      else await interaction.reply(payload);
+    } catch {
+      // Interação já expirada: nada mais a fazer
+    }
+  }
 });
 
 // ---------------------------------------------------------------------
 // Handler de Mensagens (Verificação Automática)
 // ---------------------------------------------------------------------
+// Pontuação de um resultado de OCR (quantos critérios foram encontrados),
+// usada para guardar o "melhor" print quando o usuário envia vários.
+const ocrScore = (r) => Number(r.foundChannelName) + Number(r.foundSubscribedWord);
+
+// ---------------------------------------------------------------------
+// Honeypot: qualquer mensagem no canal restrito resulta em banimento.
+// deleteMessageSeconds apaga o histórico recente do usuário em TODOS os
+// canais (útil contra contas comprometidas que saem spammando).
+// Requer a permissão "Banir Membros" e cargo do bot acima do usuário.
+// ---------------------------------------------------------------------
+async function handleHoneypotViolation(message) {
+  const { author, guild } = message;
+  console.log(`[SEGURANÇA] Violação detectada do usuário ${author.tag} (${author.id})`);
+
+  try {
+    await guild.members.ban(author.id, {
+      deleteMessageSeconds: HONEYPOT_DELETE_SECONDS,
+      reason: 'Segurança: envio de mensagem em canal proibido/restrito (honeypot)',
+    });
+    console.log(`[SEGURANÇA] Usuário ${author.tag} banido com sucesso.`);
+    await sendHoneypotLog(client, message, { banned: true });
+  } catch (err) {
+    console.error('[SEGURANÇA ERRO] Não foi possível banir o usuário:', err.message);
+    // Se o ban falhou, ao menos remove a mensagem do canal
+    await message.delete().catch(() => {});
+    await sendHoneypotLog(client, message, { banned: false, errorMessage: err.message });
+  }
+}
+
+// ---------------------------------------------------------------------
+// Handler de Mensagens
+// ---------------------------------------------------------------------
 client.on('messageCreate', async (message) => {
   try {
     if (message.author.bot) return;
+    if (!message.guild) return;
     if (!markProcessedOnce(processedMessageIds, message.id)) return;
 
     // -----------------------------------------------------------------
     // Sistema de Segurança / Canal Restrito (Honeypot)
     // -----------------------------------------------------------------
-    if (message.channel.id === HONEYPOT_CHANNEL_ID) {
-      console.log(`[SEGURANÇA] Violação detectada do usuário ${message.author.tag} (${message.author.id})`);
-
-      const recentMessages = await message.channel.messages.fetch({ limit: 50 }).catch(() => null);
-      if (recentMessages) {
-        const userMsgs = recentMessages.filter((m) => m.author.id === message.author.id);
-        if (userMsgs.size > 0) {
-          await message.channel.bulkDelete(userMsgs).catch(() => {});
-        }
-      }
-
-      await message.guild.members.kick(message.author.id, 'Segurança: Envio de mensagem em canal proibido/restrito')
-        .then(() => console.log(`[SEGURANÇA] Usuário ${message.author.tag} expulso com sucesso.`))
-        .catch((err) => console.error(`[SEGURANÇA ERRO] Não foi possível expulsar o usuário:`, err.message));
-
+    if (HONEYPOT_CHANNEL_ID && message.channel.id === HONEYPOT_CHANNEL_ID) {
+      await handleHoneypotViolation(message);
       return;
     }
 
@@ -813,6 +1071,13 @@ client.on('messageCreate', async (message) => {
     // -----------------------------------------------------------------
     if (message.channel.id !== VERIFICATION_CHANNEL_ID) return;
 
+    // Quem já é verificado não precisa gastar tentativa nem chamada de OCR
+    const member = await fetchMember(message.guild, message.author.id);
+    if (hasVerifiedRole(member)) {
+      await replyAndCleanup(message, '✅ Você já está verificado! Não precisa enviar outro print.');
+      return;
+    }
+
     const startTime = Date.now();
 
     const validAttachments = [...message.attachments.values()].filter((att) =>
@@ -820,43 +1085,36 @@ client.on('messageCreate', async (message) => {
     );
 
     if (validAttachments.length === 0) {
-      const aviso = await message.reply(
+      await replyAndCleanup(
+        message,
         '📎 Envie um **print de tela** mostrando o canal **Shai WZL** e o botão **"Inscrito"** para eu poder verificar.'
       );
-      setTimeout(() => {
-        aviso.delete().catch(() => {});
-        message.delete().catch(() => {});
-      }, 15000);
       return;
     }
 
     const imageAttachments = validAttachments.filter((att) => att.size <= MAX_FILE_SIZE_BYTES);
 
     if (imageAttachments.length === 0) {
-      const aviso = await message.reply(
+      await replyAndCleanup(
+        message,
         `⚠️ A imagem enviada é muito grande! Envie um print com tamanho menor que **${MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB**.`
       );
-      setTimeout(() => {
-        aviso.delete().catch(() => {});
-        message.delete().catch(() => {});
-      }, 15000);
       return;
     }
 
     if (isRateLimited(message.author.id)) {
       const resetSeconds = getRateLimitResetSeconds(message.author.id);
-      const aviso = await message.reply(
+      await replyAndCleanup(
+        message,
         `🕒 Você atingiu o limite de **${RATE_LIMIT_MAX_ATTEMPTS} tentativas** em um curto período. Tente novamente em **${resetSeconds}s**.`
       );
-      setTimeout(() => {
-        aviso.delete().catch(() => {});
-        message.delete().catch(() => {});
-      }, 15000);
       return;
     }
     registerAttempt(message.author.id);
 
-    await message.react('⏳').catch(() => {});
+    // Guarda a reação retornada por react(): é mais confiável do que procurá-la
+    // depois no cache de reações (que este bot mantém desabilitado).
+    const hourglass = await message.react('⏳').catch(() => null);
 
     let melhorResultado = null;
 
@@ -874,12 +1132,12 @@ client.on('messageCreate', async (message) => {
         melhorResultado = resultado;
         break;
       }
-      if (!melhorResultado) {
+      if (!melhorResultado || ocrScore(resultado) > ocrScore(melhorResultado)) {
         melhorResultado = resultado;
       }
     }
 
-    await message.reactions.resolve('⏳')?.users.remove(client.user.id).catch(() => {});
+    await hourglass?.users.remove(client.user.id).catch(() => {});
 
     const durationSeconds = ((Date.now() - startTime) / 1000).toFixed(2);
 
@@ -891,7 +1149,17 @@ client.on('messageCreate', async (message) => {
       recordStatEvent('ocr_error');
 
       // 1. Envia notificação para o canal da Staff (com botões de aprovar/recusar)
-      await notifyStaffForManualReview(client, message.author, printUrl);
+      const staffMessage = await notifyStaffForManualReview(client, message.author, printUrl);
+
+      // Se a staff não pôde ser acionada (canal inválido, sem permissão...), não
+      // prometer uma análise manual que nunca vai acontecer.
+      if (!staffMessage) {
+        const botReply = await message.reply(
+          '⚠️ Ocorreu um erro ao ler a sua imagem e não consegui acionar a **STAFF** automaticamente. Tente enviar o print novamente em alguns minutos ou abra um ticket.'
+        );
+        scheduleMessageCleanup(message, botReply, WARNING_CLEANUP_DELAY_MS);
+        return;
+      }
 
       // 2. Avisa no canal de verificação
       const botReply = await message.reply(
@@ -918,13 +1186,9 @@ client.on('messageCreate', async (message) => {
     if (melhorResultado.passed) {
       await message.react('✅').catch(() => {});
 
-      if (VERIFIED_ROLE_ID) {
-        const member = message.member || (await message.guild.members.fetch(message.author.id).catch(() => null));
-        if (member && !member.roles.cache.has(VERIFIED_ROLE_ID)) {
-          await member.roles.add(VERIFIED_ROLE_ID).catch((err) =>
-            console.error('[CARGO ERRO]', err.message)
-          );
-        }
+      const memberToVerify = member ?? (await fetchMember(message.guild, message.author.id));
+      if (memberToVerify) {
+        await grantVerifiedRole(memberToVerify);
       }
 
       const embed = new EmbedBuilder()
@@ -938,13 +1202,18 @@ client.on('messageCreate', async (message) => {
       await sendLogEmbed(client, message.author, true, durationSeconds);
       recordStatEvent('auto_approved');
       resetFailures(message.author.id);
-
     } else {
       await message.react('❌').catch(() => {});
 
       const motivos = [];
       if (!melhorResultado.foundChannelName) motivos.push('Não encontrou o nome do canal (Shai WZL)');
-      if (!melhorResultado.foundSubscribedWord) motivos.push('Não encontrou a confirmação de inscrito');
+      if (!melhorResultado.foundSubscribedWord) {
+        motivos.push(
+          melhorResultado.foundNegative
+            ? 'O print mostra o botão "Inscrever-se" — parece que você ainda não está inscrito'
+            : 'Não encontrou a confirmação de inscrito'
+        );
+      }
 
       const motivosTexto = motivos.join(' e ');
 
