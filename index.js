@@ -15,6 +15,7 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  ChannelType,
 } = require('discord.js');
 const cron = require('node-cron');
 
@@ -638,8 +639,7 @@ process.on('unhandledRejection', (err) => {
 client.once('ready', async () => {
   console.log(`[INÍCIO] Bot online como: ${client.user.tag}`);
 
-  // Função para atualizar a presença com a contagem real de membros
-// Função para atualizar a presença com a contagem de dias até o desligamento
+  // Função para atualizar a presença com a contagem de dias até o desligamento
   const updatePresence = () => {
     try {
       const targetDate = new Date('2026-10-18T23:59:00-03:00');
@@ -708,36 +708,31 @@ client.once('ready', async () => {
   }
 
   // ---------------------------------------------------------------------
-  // Agendamento: Liberar canais em 18/10/2026 às 23:59 (Horário de Brasília / UTC-3)
-  // Nota: 23:59 em UTC-3 equivale a 02:59 UTC do dia 19/10/2026.
+  // Agendamento: Liberar a Categoria 1438261962336112761 em 18/10/2026 às 23:59 (Horário de Brasília / UTC-3)
   // ---------------------------------------------------------------------
-  const TARGET_CHANNEL_IDS = [
-    '1438262073095229675',
-    '1448887383457009707'
-  ];
+  const CATEGORY_ID = '1438261962336112761';
 
   // Cron formato: 'segundo minuto hora dia mês dia-da-semana'
   // Configurado para rodar no fuso horário 'America/Sao_Paulo' (UTC-3)
   cron.schedule('0 59 23 18 10 *', async () => {
-    console.log('[AGENDAMENTO] Iniciando liberação dos canais...');
+    console.log('[AGENDAMENTO] Iniciando liberação da categoria...');
 
-    for (const channelId of TARGET_CHANNEL_IDS) {
-      try {
-        const channel = await client.channels.fetch(channelId);
-        if (!channel) {
-          console.error(`[AGENDAMENTO ERRO] Canal ID ${channelId} não encontrado.`);
-          continue;
-        }
+    try {
+      const category = await client.channels.fetch(CATEGORY_ID);
 
-        // Libera a permissão de visualização para o cargo @everyone
-        await channel.permissionOverwrites.edit(channel.guild.id, {
-          [PermissionFlagsBits.ViewChannel]: true,
-        });
-
-        console.log(`[AGENDAMENTO SUCESSO] Canal ${channel.name} (${channelId}) liberado para @everyone!`);
-      } catch (err) {
-        console.error(`[AGENDAMENTO ERRO] Falha ao alterar permissões do canal ${channelId}:`, err.message);
+      if (!category || category.type !== ChannelType.GuildCategory) {
+        console.error(`[AGENDAMENTO ERRO] Categoria ID ${CATEGORY_ID} não encontrada ou não é uma categoria.`);
+        return;
       }
+
+      // Libera a permissão de "Ver Canais" para o cargo @everyone na categoria
+      await category.permissionOverwrites.edit(category.guild.id, {
+        [PermissionFlagsBits.ViewChannel]: true,
+      });
+
+      console.log(`[AGENDAMENTO SUCESSO] Categoria ${category.name} (${CATEGORY_ID}) liberada para @everyone!`);
+    } catch (err) {
+      console.error(`[AGENDAMENTO ERRO] Falha ao alterar permissões da categoria ${CATEGORY_ID}:`, err.message);
     }
   }, {
     timezone: "America/Sao_Paulo" // Define o fuso oficial de Brasília
@@ -774,20 +769,16 @@ async function handleInteraction(interaction) {
     const { commandName, options, guild } = interaction;
 
     if (commandName === 'aprovar' || commandName === 'recusar') {
-      // Acknowledge the interaction immediately (within Discord's 3s window).
-      // Everything below can be slow (member fetch, role add, DM, log embed),
-      // so we defer first and use editReply() from here on instead of reply().
       try {
         await interaction.deferReply();
       } catch (err) {
         console.error('[DEFER ERRO]', err.message);
-        return; // token already dead, nothing more we can do
+        return;
       }
 
       const targetUser = options.getUser('usuario');
 
       if (commandName === 'aprovar') {
-        // Aprovar exige o membro no servidor (ele precisa receber o cargo)
         const member = await fetchMember(guild, targetUser.id);
 
         if (!member) {
@@ -805,7 +796,6 @@ async function handleInteraction(interaction) {
         recordStatEvent('manual_approved');
         resetFailures(targetUser.id);
 
-        // Encerra solicitações pendentes desse usuário (tira dos /pendentes e desativa os botões)
         await closePendingReviewsForUser(client, targetUser.id, {
           color: 0x2ecc71,
           footerText: `✅ Aprovado por ${interaction.user.tag} (via /aprovar)`,
@@ -822,8 +812,6 @@ async function handleInteraction(interaction) {
         });
       }
 
-      // /recusar: não exige que o usuário ainda esteja no servidor, assim a staff
-      // consegue limpar pendências de quem já saiu.
       const motivo = options.getString('motivo') || 'Recusado manualmente pela moderação.';
 
       await sendDMNotification(targetUser, false, motivo);
@@ -843,7 +831,6 @@ async function handleInteraction(interaction) {
     if (commandName === 'pendentes') {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-      // Descarta pendências cuja mensagem foi apagada ou já foi resolvida por outro caminho
       const entries = [...pendingManualReviews.entries()];
       const stillOpen = await Promise.all(
         entries.map(([messageId, data]) => isPendingStillOpen(client, messageId, data))
@@ -940,7 +927,6 @@ async function handleInteraction(interaction) {
         });
       }
 
-      // Se o cargo falhar, a solicitação continua aberta para a staff tentar de novo
       if (!(await grantVerifiedRole(member))) {
         return interaction.followUp({
           content: ROLE_ERROR_MESSAGE,
@@ -954,7 +940,6 @@ async function handleInteraction(interaction) {
       resetFailures(userId);
 
       pendingManualReviews.delete(interaction.message.id);
-      // Se o mesmo usuário tiver outras solicitações abertas, encerra todas
       await closePendingReviewsForUser(client, userId, {
         color: 0x2ecc71,
         footerText: `✅ Aprovado por ${interaction.user.tag}`,
@@ -968,7 +953,6 @@ async function handleInteraction(interaction) {
     }
 
     if (action === 'staff_reject') {
-      // Abre um modal pra staff informar o motivo (opcional) antes de recusar
       const modal = new ModalBuilder()
         .setCustomId(`staff_reject_modal:${userId}`)
         .setTitle('Motivo da recusa');
@@ -1011,7 +995,6 @@ async function handleInteraction(interaction) {
     recordStatEvent('manual_rejected');
 
     pendingManualReviews.delete(interaction.message.id);
-    // Se o mesmo usuário tiver outras solicitações abertas, encerra todas
     await closePendingReviewsForUser(client, userId, {
       color: 0xe74c3c,
       footerText: `❌ Recusado por ${interaction.user.tag}`,
@@ -1025,8 +1008,6 @@ async function handleInteraction(interaction) {
   }
 }
 
-// Wrapper: qualquer erro inesperado é logado e o usuário recebe um aviso,
-// em vez de ver "O aplicativo não respondeu".
 client.on('interactionCreate', async (interaction) => {
   try {
     await handleInteraction(interaction);
@@ -1041,7 +1022,7 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.deferred || interaction.replied) await interaction.followUp(payload);
       else await interaction.reply(payload);
     } catch {
-      // Interação já expirada: nada mais a fazer
+      // Interação já expirada
     }
   }
 });
@@ -1049,16 +1030,8 @@ client.on('interactionCreate', async (interaction) => {
 // ---------------------------------------------------------------------
 // Handler de Mensagens (Verificação Automática)
 // ---------------------------------------------------------------------
-// Pontuação de um resultado de OCR (quantos critérios foram encontrados),
-// usada para guardar o "melhor" print quando o usuário envia vários.
 const ocrScore = (r) => Number(r.foundChannelName) + Number(r.foundSubscribedWord);
 
-// ---------------------------------------------------------------------
-// Honeypot: qualquer mensagem no canal restrito resulta em banimento.
-// deleteMessageSeconds apaga o histórico recente do usuário em TODOS os
-// canais (útil contra contas comprometidas que saem spammando).
-// Requer a permissão "Banir Membros" e cargo do bot acima do usuário.
-// ---------------------------------------------------------------------
 async function handleHoneypotViolation(message) {
   const { author, guild } = message;
   console.log(`[SEGURANÇA] Violação detectada do usuário ${author.tag} (${author.id})`);
@@ -1072,35 +1045,24 @@ async function handleHoneypotViolation(message) {
     await sendHoneypotLog(client, message, { banned: true });
   } catch (err) {
     console.error('[SEGURANÇA ERRO] Não foi possível banir o usuário:', err.message);
-    // Se o ban falhou, ao menos remove a mensagem do canal
     await message.delete().catch(() => {});
     await sendHoneypotLog(client, message, { banned: false, errorMessage: err.message });
   }
 }
 
-// ---------------------------------------------------------------------
-// Handler de Mensagens
-// ---------------------------------------------------------------------
 client.on('messageCreate', async (message) => {
   try {
     if (message.author.bot) return;
     if (!message.guild) return;
     if (!markProcessedOnce(processedMessageIds, message.id)) return;
 
-    // -----------------------------------------------------------------
-    // Sistema de Segurança / Canal Restrito (Honeypot)
-    // -----------------------------------------------------------------
     if (HONEYPOT_CHANNEL_ID && message.channel.id === HONEYPOT_CHANNEL_ID) {
       await handleHoneypotViolation(message);
       return;
     }
 
-    // -----------------------------------------------------------------
-    // Canal de Verificação
-    // -----------------------------------------------------------------
     if (message.channel.id !== VERIFICATION_CHANNEL_ID) return;
 
-    // Quem já é verificado não precisa gastar tentativa nem chamada de OCR
     const member = await fetchMember(message.guild, message.author.id);
     if (hasVerifiedRole(member)) {
       await replyAndCleanup(message, '✅ Você já está verificado! Não precisa enviar outro print.');
@@ -1141,8 +1103,6 @@ client.on('messageCreate', async (message) => {
     }
     registerAttempt(message.author.id);
 
-    // Guarda a reação retornada por react(): é mais confiável do que procurá-la
-    // depois no cache de reações (que este bot mantém desabilitado).
     const hourglass = await message.react('⏳').catch(() => null);
 
     let melhorResultado = null;
@@ -1170,18 +1130,14 @@ client.on('messageCreate', async (message) => {
 
     const durationSeconds = ((Date.now() - startTime) / 1000).toFixed(2);
 
-    // CASO DE ERRO DE LEITURA DA API / TIMEOUT
     if (!melhorResultado) {
       await message.react('⚠️').catch(() => {});
 
       const printUrl = imageAttachments[0].url;
       recordStatEvent('ocr_error');
 
-      // 1. Envia notificação para o canal da Staff (com botões de aprovar/recusar)
       const staffMessage = await notifyStaffForManualReview(client, message.author, printUrl);
 
-      // Se a staff não pôde ser acionada (canal inválido, sem permissão...), não
-      // prometer uma análise manual que nunca vai acontecer.
       if (!staffMessage) {
         const botReply = await message.reply(
           '⚠️ Ocorreu um erro ao ler a sua imagem e não consegui acionar a **STAFF** automaticamente. Tente enviar o print novamente em alguns minutos ou abra um ticket.'
@@ -1190,12 +1146,10 @@ client.on('messageCreate', async (message) => {
         return;
       }
 
-      // 2. Avisa no canal de verificação
       const botReply = await message.reply(
         `⚠️ Ocorreu um erro ao tentar ler a sua imagem. Sua verificação foi encaminhada para a **STAFF** e, por demandar da equipe de suporte, a análise manual pode levar **algumas horas**.`
       );
 
-      // 3. Avisa na DM do usuário
       try {
         const dmEmbed = new EmbedBuilder()
           .setColor(0xf1c40f)
@@ -1263,7 +1217,7 @@ client.on('messageCreate', async (message) => {
 
       const failureCount = registerFailure(message.author.id);
       if (failureCount >= MAX_CONSECUTIVE_FAILURES) {
-        resetFailures(message.author.id); // evita repetir o aviso a cada falha subsequente
+        resetFailures(message.author.id);
 
         const avisoEmbed = new EmbedBuilder()
           .setColor(0xf1c40f)
