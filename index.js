@@ -16,6 +16,7 @@ const {
   TextInputBuilder,
   TextInputStyle,
 } = require('discord.js');
+const cron = require('node-cron');
 
 // ---------------------------------------------------------------------
 // Configuração
@@ -638,36 +639,28 @@ client.once('ready', async () => {
   console.log(`[INÍCIO] Bot online como: ${client.user.tag}`);
 
   // Função para atualizar a presença com a contagem real de membros
-  const updatePresence = async () => {
+// Função para atualizar a presença com a contagem de dias até o desligamento
+  const updatePresence = () => {
     try {
-      // Pega a guilda do bot (se você souber o GUILD_ID usa fetch, se não, pega a primeira)
-      const guild = GUILD_ID 
-        ? await client.guilds.fetch(GUILD_ID).catch(() => null) 
-        : client.guilds.cache.first();
+      const targetDate = new Date('2026-10-18T23:59:00-03:00');
+      const now = new Date();
+      const diffTime = targetDate - now;
+      const dias = Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)));
 
-      if (guild) {
-        // fetch() na guilda atualiza o memberCount sem carregar os membros na RAM
-        const fullGuild = await guild.fetch();
-        const memberCount = fullGuild.memberCount;
-
-        client.user.setActivity({
-          name: `🛠️ Shai | 👥 ${memberCount} membros`,
-          type: ActivityType.Playing, // Define como "Jogando"
-        });
-      }
+      client.user.setActivity({
+        name: `🗓️ ${dias} dias até o desligamento`,
+        type: ActivityType.Playing,
+      });
     } catch (err) {
       console.error('[PRESENÇA ERRO] Falha ao atualizar status:', err.message);
     }
   };
 
   // Executa imediatamente ao ligar
-  await updatePresence();
+  updatePresence();
 
-  // Atualiza a contagem a cada 10 minutos (600.000 ms)
-  setInterval(updatePresence, 600000);
-
-  // Limpa tentativas de rate limit já expiradas (evita crescimento do Map)
-  setInterval(sweepExpiredAttempts, RATE_LIMIT_WINDOW_MS);
+  // Atualiza a cada 1 hora (3.600.000 ms) para manter o número de dias correto
+  setInterval(updatePresence, 3600000);
 
   // Registro dos Slash Commands...
   const commands = [
@@ -713,6 +706,42 @@ client.once('ready', async () => {
   } catch (err) {
     console.error('[SLASH ERRO] Falha ao registrar comandos:', err.message);
   }
+
+  // ---------------------------------------------------------------------
+  // Agendamento: Liberar canais em 18/10/2026 às 23:59 (Horário de Brasília / UTC-3)
+  // Nota: 23:59 em UTC-3 equivale a 02:59 UTC do dia 19/10/2026.
+  // ---------------------------------------------------------------------
+  const TARGET_CHANNEL_IDS = [
+    '1438262073095229675',
+    '1448887383457009707'
+  ];
+
+  // Cron formato: 'segundo minuto hora dia mês dia-da-semana'
+  // Configurado para rodar no fuso horário 'America/Sao_Paulo' (UTC-3)
+  cron.schedule('0 59 23 18 10 *', async () => {
+    console.log('[AGENDAMENTO] Iniciando liberação dos canais...');
+
+    for (const channelId of TARGET_CHANNEL_IDS) {
+      try {
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) {
+          console.error(`[AGENDAMENTO ERRO] Canal ID ${channelId} não encontrado.`);
+          continue;
+        }
+
+        // Libera a permissão de visualização para o cargo @everyone
+        await channel.permissionOverwrites.edit(channel.guild.id, {
+          [PermissionFlagsBits.ViewChannel]: true,
+        });
+
+        console.log(`[AGENDAMENTO SUCESSO] Canal ${channel.name} (${channelId}) liberado para @everyone!`);
+      } catch (err) {
+        console.error(`[AGENDAMENTO ERRO] Falha ao alterar permissões do canal ${channelId}:`, err.message);
+      }
+    }
+  }, {
+    timezone: "America/Sao_Paulo" // Define o fuso oficial de Brasília
+  });
 });
 
 // Usuário saiu do servidor: encerra as pendências dele para não sobrarem em /pendentes
